@@ -272,12 +272,63 @@ func (p *ProcessingMedia) store(ctx context.Context) error {
 
 	switch p.media.Type {
 	case gtsmodel.FileTypeImage,
-		gtsmodel.FileTypeVideo,
 		gtsmodel.FileTypeGifv:
 		// Attempt to clean as much metadata from file as possible.
 		if err := clearMetadata(ctx, temppath); err != nil {
 			return gtserror.Newf("error cleaning metadata: %w", err)
 		}
+
+	case gtsmodel.FileTypeVideo:
+		// Downscale oversized video before it is stored. GoToSocial keeps
+		// uploads byte-for-byte, so without this a 16Mbps 1080p clip is
+		// stored and re-served at over 100MB. See transcode.go.
+		targetWidth, transcode := shouldTranscodeVideo(width, height)
+		if !transcode {
+			// Already small enough: only strip metadata.
+			if err := clearMetadata(ctx, temppath); err != nil {
+				return gtserror.Newf("error cleaning metadata: %w", err)
+			}
+			break
+		}
+
+		transcoded, err := transcodeVideo(ctx, temppath, targetWidth)
+		if err != nil {
+			// Never fail the upload over this: a stored-but-large video
+			// still beats a lost post. Store the original, cleaned.
+			log.Warnf(ctx, "could not transcode video (%dx%d), storing original: %v", width, height, err)
+			if err := clearMetadata(ctx, temppath); err != nil {
+				return gtserror.Newf("error cleaning metadata: %w", err)
+			}
+			break
+		}
+
+		// Drop the oversize original from tmp storage.
+		if err := os.Remove(temppath); err != nil {
+			log.Warnf(ctx, "could not remove pre-transcode temp file: %v", err)
+		}
+		temppath = transcoded
+
+		// The media file now has new dimensions and bitrate, so re-probe
+		// it and refresh the metadata that gets stored alongside it.
+		result, err = probe(ctx, temppath)
+		if err != nil {
+			return gtserror.Newf("error probing transcoded video: %w", err)
+		}
+
+		width, height, framerate = result.ImageMeta()
+		aspect = util.Div(float32(width), float32(height))
+		p.media.FileMeta.Original.Width = width
+		p.media.FileMeta.Original.Height = height
+		p.media.FileMeta.Original.Size = (width * height)
+		p.media.FileMeta.Original.Aspect = aspect
+		p.media.FileMeta.Original.Framerate = util.PtrIf(framerate)
+		p.media.FileMeta.Original.Duration = util.PtrIf(float32(result.duration))
+		p.media.FileMeta.Original.Bitrate = util.PtrIf(result.bitrate)
+
+		// Transcodes are always mp4, whatever the input container was, so
+		// the stored extension and content type must follow.
+		p.media.File.ContentType = "video/mp4"
+		ext = "mp4"
 
 	case gtsmodel.FileTypeAudio:
 		// NOTE: we do not clean audio file
